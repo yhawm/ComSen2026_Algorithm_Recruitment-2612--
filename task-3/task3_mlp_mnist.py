@@ -1,38 +1,85 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import os
+import io
+from PIL import Image
 
-# ================= 1. 基础配置 =================
+# ========== 设备配置 ==========
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {device}")
 
-# 确保 output 目录存在
-os.makedirs('../output', exist_ok=True)
+# ========== 【终极修复版】Dataset ==========
+class ParquetMNIST(Dataset):
+    def __init__(self, parquet_path):
+        if not os.path.exists(parquet_path):
+            raise FileNotFoundError(f"找不到文件: {parquet_path}")
+        
+        self.df = pd.read_parquet(parquet_path)
+        print(f"成功加载 {parquet_path}，数据集大小: {len(self.df)}")
+        print(f"数据集列名: {self.df.columns.tolist()}")
+        
+        self.label_col = 'label'
+        self.pixel_col = 'image'
 
-# ================= 2. 数据加载与预处理 =================
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))
-])
+    def __len__(self):
+        return len(self.df)
 
-# 注意：如果你手动下载了，download=True 不会重复下载，而是直接加载本地文件
-try:
-    train_dataset = datasets.MNIST(root='../data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(root='../data', train=False, download=True, transform=transform)
-except Exception as e:
-    print(f"数据加载失败，请检查 ../data/MNIST/raw/ 目录下是否有4个 .gz 文件。错误信息: {e}")
-    exit()
+    def __getitem__(self, idx):
+        # 1. 提取标签
+        label = self.df.iloc[idx][self.label_col]
+        
+        # 2. 提取图像数据
+        img_data = self.df.iloc[idx][self.pixel_col]
+        
+        # 3. 核心解码逻辑：根据数据类型不同采取不同操作
+        if isinstance(img_data, dict):
+            # 情况A：数据是字典，包含 'bytes' 字段（如 HuggingFace 数据集）
+            if 'bytes' in img_data:
+                # 用 PIL 从内存字节流中解码图片
+                image = Image.open(io.BytesIO(img_data['bytes'])).convert('L')
+                pixels = np.array(image, dtype=np.float32).flatten()
+            # 情况B：数据是字典，包含 'array' 字段
+            elif 'array' in img_data:
+                pixels = np.array(img_data['array'], dtype=np.float32).flatten()
+            else:
+                raise ValueError(f"未知的字典格式，键为: {img_data.keys()}")
+        elif isinstance(img_data, (np.ndarray, list)):
+            # 情况C：数据已经是数组或列表
+            pixels = np.array(img_data, dtype=np.float32).flatten()
+        else:
+            raise TypeError(f"不支持的图像数据类型: {type(img_data)}")
+        
+        # 4. 尺寸检查
+        if pixels.size != 784:
+            raise ValueError(f"图像数据尺寸异常，期望784，实际{pixels.size}。")
+        
+        # 5. 归一化
+        if pixels.max() > 1.0:
+            pixels = pixels / 255.0
+        
+        # 6. 转为 Tensor 并 reshape
+        img_tensor = torch.tensor(pixels).reshape(1, 28, 28)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+        
+        return img_tensor, label_tensor
 
-# 划分验证集（从训练集中取 20%）
-val_size = int(0.2 * len(train_dataset))
-train_size = len(train_dataset) - val_size
-train_dataset, val_dataset = torch.utils.data.random_split(
-    train_dataset, [train_size, val_size]
+# ========== 数据加载与预处理 ==========
+parquet_path = 'train-00000-of-00001.parquet' 
+full_dataset = ParquetMNIST(parquet_path=parquet_path)
+
+# 手动切分 70% / 15% / 15%
+total_size = len(full_dataset)
+train_size = int(0.7 * total_size)
+val_size = int(0.15 * total_size)
+test_size = total_size - train_size - val_size
+
+train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+    full_dataset, [train_size, val_size, test_size]
 )
 
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
@@ -41,7 +88,7 @@ test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
 print(f"训练集: {len(train_dataset)}, 验证集: {len(val_dataset)}, 测试集: {len(test_dataset)}")
 
-# ================= 3. 定义 MLP 模型 =================
+# ========== 定义 MLP 模型 ==========
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -51,43 +98,40 @@ class MLP(nn.Module):
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.3),
-
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.3),
-
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.2),
-
             nn.Linear(128, 10)
         )
-
     def forward(self, x):
         x = self.flatten(x)
         return self.network(x)
 
 model = MLP().to(device)
+print(model)
+
+# ========== 训练配置 ==========
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
-# ================= 4. 训练与评估循环 =================
+os.makedirs('../output/task3', exist_ok=True)
+
+# ========== 训练循环 ==========
 epochs = 15
 train_losses, val_losses = [], []
 train_accs, val_accs = [], []
-test_accs = []  # 【新增】用于记录每个epoch的测试集准确率
-
 best_val_acc = 0.0
 
-print("\n开始训练...")
 for epoch in range(epochs):
-    # ---- 训练阶段 ----
+    # 训练
     model.train()
     running_loss, correct, total = 0.0, 0, 0
-
     for images, labels in train_loader:
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
@@ -95,16 +139,13 @@ for epoch in range(epochs):
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-
         running_loss += loss.item() * images.size(0)
         _, predicted = torch.max(outputs, 1)
         correct += (predicted == labels).sum().item()
         total += labels.size(0)
+    train_loss, train_acc = running_loss / total, correct / total
 
-    train_loss = running_loss / total
-    train_acc = correct / total
-
-    # ---- 验证阶段 ----
+    # 验证
     model.eval()
     val_running_loss, val_correct, val_total = 0.0, 0, 0
     with torch.no_grad():
@@ -116,105 +157,63 @@ for epoch in range(epochs):
             _, predicted = torch.max(outputs, 1)
             val_correct += (predicted == labels).sum().item()
             val_total += labels.size(0)
-
-    val_loss = val_running_loss / val_total
-    val_acc = val_correct / val_total
-
-    # ---- 【新增】测试集评估阶段（每个Epoch跑一次） ----
-    test_correct, test_total = 0, 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-            test_correct += (predicted == labels).sum().item()
-            test_total += labels.size(0)
-    epoch_test_acc = test_correct / test_total
-
+    val_loss, val_acc = val_running_loss / val_total, val_correct / val_total
     scheduler.step()
 
-    # 记录数据
-    train_losses.append(train_loss)
-    val_losses.append(val_loss)
-    train_accs.append(train_acc)
-    val_accs.append(val_acc)
-    test_accs.append(epoch_test_acc)  # 记录测试集准确率
+    train_losses.append(train_loss); val_losses.append(val_loss)
+    train_accs.append(train_acc); val_accs.append(val_acc)
 
-    print(f"Epoch [{epoch+1}/{epochs}] "
-          f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
-          f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f} | "
-          f"Test Acc: {epoch_test_acc:.4f}")
+    print(f"Epoch [{epoch+1}/{epochs}] Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(model.state_dict(), '../output/best_mlp_model.pth')
+        torch.save(model.state_dict(), '../output/task3/best_mlp_model.pth')
 
-# ================= 5. 最终测试评估 =================
-model.load_state_dict(torch.load('../output/best_mlp_model.pth'))
+# ========== 测试 ==========
+model.load_state_dict(torch.load('../output/task3/best_mlp_model.pth'))
 model.eval()
-final_test_correct, final_test_total = 0, 0
-
+test_correct, test_total = 0, 0
 with torch.no_grad():
     for images, labels in test_loader:
         images, labels = images.to(device), labels.to(device)
         outputs = model(images)
         _, predicted = torch.max(outputs, 1)
-        final_test_correct += (predicted == labels).sum().item()
-        final_test_total += labels.size(0)
+        test_correct += (predicted == labels).sum().item()
+        test_total += labels.size(0)
+test_acc = test_correct / test_total
+print(f"\n===== 测试集准确率: {test_acc:.4f} ({test_acc*100:.2f}%) =====")
 
-final_test_acc = final_test_correct / final_test_total
-print(f"\n===== 最终测试集准确率: {final_test_acc:.4f} ({final_test_acc*100:.2f}%) =====")
-
-# ================= 6. 绘图一：Loss 与 Accuracy 曲线 =================
-fig1, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-# 图1：Loss 曲线
+# ========== 绘图与可视化 ==========
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 axes[0].plot(range(1, epochs+1), train_losses, 'b-o', label='Train Loss')
 axes[0].plot(range(1, epochs+1), val_losses, 'r-o', label='Val Loss')
-axes[0].set_xlabel('Epoch')
-axes[0].set_ylabel('Loss')
-axes[0].set_title('Loss Curve')
-axes[0].legend()
-axes[0].grid(True, alpha=0.3)
+axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss'); axes[0].set_title('Loss Curve'); axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
-# 图2：Accuracy 曲线（包含 Train, Val, Test）
 axes[1].plot(range(1, epochs+1), train_accs, 'b-o', label='Train Acc')
 axes[1].plot(range(1, epochs+1), val_accs, 'r-o', label='Val Acc')
-axes[1].plot(range(1, epochs+1), test_accs, 'g-o', label='Test Acc')  # 测试集曲线
-axes[1].set_xlabel('Epoch')
-axes[1].set_ylabel('Accuracy')
-axes[1].set_title('Accuracy Curve')
-axes[1].legend()
-axes[1].grid(True, alpha=0.3)
-
+axes[1].axhline(y=test_acc, color='g', linestyle='--', label=f'Test Acc: {test_acc:.4f}')
+axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Accuracy'); axes[1].set_title('Accuracy Curve'); axes[1].legend(); axes[1].grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig('../output/mnist_curves.png', dpi=150)
-plt.close() # 关闭当前画板，避免和后面冲突
-print("Loss 与 Accuracy 曲线已保存到 ../output/mnist_curves.png")
+plt.savefig('../output/task3/mnist_loss_acc.png', dpi=150)
+plt.show()
 
-# ================= 7. 绘图二：可视化至少3张手写数字图片 =================
 model.eval()
-# 从测试集中取一个 batch 的数据
 test_images, test_labels = next(iter(test_loader))
 test_images, test_labels = test_images.to(device), test_labels.to(device)
-
 with torch.no_grad():
     outputs = model(test_images[:6])
     _, preds = torch.max(outputs, 1)
 
 fig2, axes2 = plt.subplots(1, 3, figsize=(10, 4))
 for i in range(3):
-    # 把 tensor 转换成 numpy，并去掉 channel 维度 (1, 28, 28) -> (28, 28)
     img = test_images[i].cpu().squeeze().numpy()
     pred = preds[i].item()
     true = test_labels[i].item()
-    
     axes2[i].imshow(img, cmap='gray')
-    axes2[i].set_title(f'Pred: {pred} | True: {true}', 
-                       color='green' if pred == true else 'red')
+    axes2[i].set_title(f'Pred: {pred} | True: {true}', color='green' if pred == true else 'red')
     axes2[i].axis('off')
-
 plt.tight_layout()
-plt.savefig('../output/mnist_visualization.png', dpi=150)
-plt.close()
-print("可视化预测图片已保存到 ../output/mnist_visualization.png")
+plt.savefig('../output/task3/mnist_visualization.png', dpi=150)
+plt.show()
+
+print("所有图像已保存到 ../output/task3/ 目录")
